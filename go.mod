@@ -1,6 +1,12 @@
-module github.com/threefoldtech/tendermint-zdb
+module github.com/mariobassem/tendermint-zdb
 
 go 1.21.0
+
+require (
+	github.com/redis/go-redis/v9 v9.2.0
+	github.com/stretchr/testify v1.8.4
+	github.com/tendermint/tm-db v0.6.7
+)
 
 require (
 	github.com/DataDog/zstd v1.4.1 // indirect
@@ -17,15 +23,9 @@ require (
 	github.com/golang/snappy v0.0.1 // indirect
 	github.com/google/btree v1.0.0 // indirect
 	github.com/jmhodges/levigo v1.0.0 // indirect
-	github.com/mattn/go-colorable v0.1.12 // indirect
-	github.com/mattn/go-isatty v0.0.14 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/redis/go-redis/v9 v9.2.0 // indirect
-	github.com/rs/zerolog v1.30.0 // indirect
-	github.com/stretchr/testify v1.8.4 // indirect
 	github.com/syndtr/goleveldb v1.0.1-0.20200815110645-5c35d600f0ca // indirect
-	github.com/tendermint/tm-db v0.6.7 // indirect
 	go.etcd.io/bbolt v1.3.6 // indirect
 	golang.org/x/net v0.0.0-20201021035429-f5854403a974 // indirect
 	golang.org/x/sys v0.0.0-20210927094055-39ccf1dd6fa6 // indirect

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/mariobassem/tendermint-zdb/pkg/zdb"
 	tmdb "github.com/tendermint/tm-db"
-	"github.com/threefoldtech/tendermint-zdb/pkg/zdb"
 )
 
 var _ tmdb.DB = (*ZDB)(nil)
