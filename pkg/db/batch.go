@@ -1,7 +1,6 @@
 package db
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -82,7 +81,7 @@ func (z *ZDBBatch) Write() error {
 
 	for len(z.setOps) > 0 {
 		op := z.setOps[0]
-		if err := z.zdb.cl.Set(context.TODO(), string(op.key), string(op.val)); err != nil {
+		if err := z.zdb.Set(op.key, op.val); err != nil {
 			return fmt.Errorf("batch write failed; try again")
 		}
 
@@ -91,7 +90,7 @@ func (z *ZDBBatch) Write() error {
 
 	for len(z.delKeys) > 0 {
 		key := z.delKeys[0]
-		if err := z.zdb.cl.Delete(context.TODO(), string(key)); err != nil {
+		if err := z.zdb.Delete(key); err != nil {
 			return fmt.Errorf("batch write failed; try again")
 		}
 

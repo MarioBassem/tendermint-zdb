@@ -1,67 +1,89 @@
 package db
 
 import (
-	"context"
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 
-	"github.com/mariobassem/tendermint-zdb/pkg/zdb"
+	"github.com/gomodule/redigo/redis"
 	tmdb "github.com/tendermint/tm-db"
 )
 
 var _ tmdb.DB = (*ZDB)(nil)
 
+var ErrCursorNoMoreData = errors.New("No more data")
+var ErrKeyNotFound = errors.New("Key not found")
+
 type ZDB struct {
-	cl *zdb.Client
+	con redis.Conn
 }
 
-func NewZDB(cl *zdb.Client) ZDB {
-	return ZDB{
-		cl: cl,
+type ScanResponse struct {
+	Next []byte
+	Keys []KeyInfo
+}
+
+type KeyInfo struct {
+	Key       []byte
+	Size      uint64
+	Timestamp int64
+}
+
+func NewZDB(address string) (ZDB, error) {
+	con, err := redis.Dial("tcp", address)
+	if err != nil {
+		return ZDB{}, err
 	}
+
+	return ZDB{
+		con: con,
+	}, nil
 }
 
 // Get fetches the value of the given key, or nil if it does not exist.
 // CONTRACT: key, value readonly []byte
 func (z *ZDB) Get(key []byte) ([]byte, error) {
-	res, err := z.cl.Get(context.TODO(), string(key))
-	if err != nil && errors.Is(err, zdb.ErrNil) {
+	res, err := redis.Bytes(z.con.Do("GET", key))
+	if err != nil && errors.Is(err, redis.ErrNil) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	return []byte(res), nil
+	return res, nil
 }
 
 // Has checks if a key exists.
 // CONTRACT: key, value readonly []byte
 func (z *ZDB) Has(key []byte) (bool, error) {
-	return z.cl.Exists(context.TODO(), string(key))
+	return redis.Bool(z.con.Do("EXISTS", key))
 }
 
 // Set sets the value for the given key, replacing it if it already exists.
 // CONTRACT: key, value readonly []byte
 func (z *ZDB) Set(key, val []byte) error {
-	return z.cl.Set(context.TODO(), string(key), string(val))
+	_, err := z.con.Do("SET", key, val)
+	return err
 }
 
 // SetSync sets the value for the given key, and flushes it to storage before returning.
 func (z *ZDB) SetSync(key, val []byte) error {
-	return z.cl.Set(context.TODO(), string(key), string(val))
+	return z.Set(key, val)
 }
 
 // Delete deletes the key, or does nothing if the key does not exist.
 // CONTRACT: key readonly []byte
 func (z *ZDB) Delete(key []byte) error {
-	return z.cl.Delete(context.TODO(), string(key))
+	_, err := z.con.Do("DEL", key)
+	return err
 }
 
 // DeleteSync deletes the key, and flushes the delete to storage before returning.
 func (z *ZDB) DeleteSync(key []byte) error {
-	return z.cl.Delete(context.TODO(), string(key))
+	return z.Delete(key)
 }
 
 // Iterator returns an iterator over a domain of keys, in ascending order. The caller must call
@@ -71,16 +93,32 @@ func (z *ZDB) DeleteSync(key []byte) error {
 // CONTRACT: No writes may happen within a domain while an iterator exists over it.
 // CONTRACT: start, end readonly []byte
 func (z *ZDB) Iterator(start, end []byte) (tmdb.Iterator, error) {
-	scanResponse, err := z.getScanResponse(start)
+	log.Printf("iterator start: %v, end: %v", start, end)
+
+	startCursor, err := z.KeyCursor(start)
+	if err != nil && err.Error() == ErrKeyNotFound.Error() {
+		return &zdbIterator{
+			zdb:     z,
+			start:   start,
+			end:     end,
+			forward: true,
+			valid:   false,
+		}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get key cursor for %v: %w", start, err)
+	}
+
+	scanResponse, err := z.getScanResponse(startCursor)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get scan result: %w", err)
 	}
 
-	keys := make([]string, 0, len(scanResponse.Keys)+1)
+	keys := make([][]byte, 0, len(scanResponse.Keys)+1)
 
-	keys = append(keys, string(start))
+	keys = append(keys, start)
 	for _, k := range scanResponse.Keys {
-		if k.Key == string(end) {
+		if bytes.Equal(k.Key, end) {
 			break
 		}
 
@@ -100,17 +138,12 @@ func (z *ZDB) Iterator(start, end []byte) (tmdb.Iterator, error) {
 	return &iterator, nil
 }
 
-func (z *ZDB) getScanResponse(start []byte) (zdb.ScanResponse, error) {
+func (z *ZDB) getScanResponse(start []byte) (ScanResponse, error) {
 	if start == nil {
-		return z.cl.Scan(context.TODO())
+		return z.Scan()
 	}
 
-	startCursor, err := z.cl.KeyCursor(context.TODO(), string(start))
-	if err != nil {
-		return zdb.ScanResponse{}, fmt.Errorf("failed to get key cursor for %s: %w", start, err)
-	}
-
-	return z.cl.ScanCursor(context.TODO(), startCursor)
+	return z.ScanCursor(start)
 }
 
 // ReverseIterator returns an iterator over a domain of keys, in descending order. The caller
@@ -120,16 +153,30 @@ func (z *ZDB) getScanResponse(start []byte) (zdb.ScanResponse, error) {
 // CONTRACT: No writes may happen within a domain while an iterator exists over it.
 // CONTRACT: start, end readonly []byte
 func (z *ZDB) ReverseIterator(start, end []byte) (tmdb.Iterator, error) {
-	scanResponse, err := z.getRScanResponse(start)
+	startCursor, err := z.KeyCursor(start)
+	if err != nil && err.Error() == ErrKeyNotFound.Error() {
+		return &zdbIterator{
+			zdb:     z,
+			forward: false,
+			valid:   false,
+			start:   start,
+			end:     end,
+		}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get key cursor for %v: %w", start, err)
+	}
+
+	scanResponse, err := z.getRScanResponse(startCursor)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get scan result: %w", err)
 	}
 
-	keys := make([]string, 0, len(scanResponse.Keys)+1)
+	keys := make([][]byte, 0, len(scanResponse.Keys)+1)
 
-	keys = append(keys, string(start))
+	keys = append(keys, start)
 	for _, k := range scanResponse.Keys {
-		if k.Key == string(end) {
+		if bytes.Equal(k.Key, end) {
 			break
 		}
 
@@ -149,22 +196,17 @@ func (z *ZDB) ReverseIterator(start, end []byte) (tmdb.Iterator, error) {
 	return &iterator, nil
 }
 
-func (z *ZDB) getRScanResponse(start []byte) (zdb.ScanResponse, error) {
+func (z *ZDB) getRScanResponse(start []byte) (ScanResponse, error) {
 	if start == nil {
-		return z.cl.RScan(context.Background())
+		return z.ReverseScan()
 	}
 
-	startCursor, err := z.cl.KeyCursor(context.TODO(), string(start))
-	if err != nil {
-		return zdb.ScanResponse{}, fmt.Errorf("failed to get key cursor for %s: %w", start, err)
-	}
-
-	return z.cl.RScanCursor(context.TODO(), startCursor)
+	return z.ReverseScanCursor(start)
 }
 
 // Close closes the database connection.
 func (z *ZDB) Close() error {
-	return z.cl.Close()
+	return z.con.Close()
 }
 
 // NewBatch creates a batch for atomic updates. The caller must call Batch.Close.
@@ -184,11 +226,169 @@ func (z *ZDB) Print() error {
 
 // Stats returns a map of property values for all keys and the size of the cache.
 func (z *ZDB) Stats() map[string]string {
-	info, err := z.cl.Info(context.TODO())
+	res, err := redis.String(z.con.Do("INFO"))
 	if err != nil {
 		log.Printf("failed to get db info: %s", err.Error())
 		return nil
 	}
 
-	return info
+	stats, err := parseInfoResponse(res)
+	if err != nil {
+		log.Printf("failed to get db info: %s", err.Error())
+		return nil
+	}
+
+	return stats
+}
+
+func parseInfoResponse(res string) (map[string]string, error) {
+	slice := strings.Split(res, "\n")
+	parsed := make(map[string]string, len(slice))
+	for _, s := range slice {
+		key, value, found := strings.Cut(s, ":")
+		if !found {
+			continue
+		}
+
+		parsed[key] = strings.Trim(value, " \r\n")
+	}
+
+	return parsed, nil
+}
+
+func (z *ZDB) Scan() (ScanResponse, error) {
+	res, err := redis.Values(z.con.Do("SCAN"))
+	if err != nil && err.Error() == ErrCursorNoMoreData.Error() {
+		return ScanResponse{}, ErrCursorNoMoreData
+	}
+	if err != nil {
+		return ScanResponse{}, err
+	}
+
+	return parseScanResponse(res)
+}
+
+func (z *ZDB) ScanCursor(cursor []byte) (ScanResponse, error) {
+	res, err := redis.Values(z.con.Do("SCAN", cursor))
+	if err != nil && err.Error() == ErrCursorNoMoreData.Error() {
+		return ScanResponse{}, ErrCursorNoMoreData
+	}
+	if err != nil {
+		return ScanResponse{}, err
+	}
+
+	return parseScanResponse(res)
+}
+
+func (z *ZDB) ReverseScan() (ScanResponse, error) {
+	res, err := redis.Values(z.con.Do("RSCAN"))
+	if err != nil && err.Error() == ErrCursorNoMoreData.Error() {
+		return ScanResponse{}, ErrCursorNoMoreData
+	}
+	if err != nil {
+		return ScanResponse{}, err
+	}
+
+	return parseScanResponse(res)
+}
+
+func (z *ZDB) ReverseScanCursor(cursor []byte) (ScanResponse, error) {
+	res, err := redis.Values(z.con.Do("RSCAN", cursor))
+	if err != nil && err.Error() == ErrCursorNoMoreData.Error() {
+		return ScanResponse{}, ErrCursorNoMoreData
+	}
+	if err != nil {
+		return ScanResponse{}, err
+	}
+
+	return parseScanResponse(res)
+}
+
+func parseScanResponse(res []interface{}) (ScanResponse, error) {
+	if len(res) != 2 {
+		return ScanResponse{}, fmt.Errorf("invalid response, scan operations should return two elements, but %d were returned", len(res))
+	}
+
+	nextCursor, ok := res[0].(string)
+	if !ok {
+		return ScanResponse{}, fmt.Errorf("invalid response, expected next key to be string, but a %t was returned", res[0])
+	}
+
+	keys, ok := res[1].([]interface{})
+	if !ok {
+		return ScanResponse{}, fmt.Errorf("invalid response, expected keys to be a slice, but a %t was returned", res[1])
+	}
+
+	ret := make([]KeyInfo, 0, len(keys))
+
+	for _, k := range keys {
+		x, ok := k.([]interface{})
+		if !ok {
+			return ScanResponse{}, fmt.Errorf("invalid response, expected key information to be a slice, but a %t was returned", k)
+		}
+
+		if len(x) != 3 {
+			return ScanResponse{}, fmt.Errorf("invalid response, expected key information to be a slice with 3 elements, but %d elements were returned", len(x))
+		}
+
+		key, ok := x[0].(string)
+		if !ok {
+			return ScanResponse{}, fmt.Errorf("invalid response, expected key to be a string, but a %t was returned", x[0])
+		}
+
+		size, ok := x[1].(int64)
+		if !ok {
+			return ScanResponse{}, fmt.Errorf("invalid response, expected key size to be a int64, but a %t was returned", x[1])
+		}
+
+		ts, ok := x[2].(int64)
+		if !ok {
+			return ScanResponse{}, fmt.Errorf("invalid response, expected key creation timestamp to be an int64, but a %t was returned", x[2])
+		}
+
+		info := KeyInfo{
+			Key:       []byte(key),
+			Size:      uint64(size),
+			Timestamp: ts,
+		}
+
+		ret = append(ret, info)
+	}
+
+	return ScanResponse{
+		Next: []byte(nextCursor),
+		Keys: ret,
+	}, nil
+}
+
+func (z *ZDB) KeyCursor(key []byte) ([]byte, error) {
+	return redis.Bytes(z.con.Do("KEYCUR", key))
+}
+
+func (z *ZDB) Ping() error {
+	_, err := z.con.Do("PING")
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (z *ZDB) Exists(key []byte) (bool, error) {
+	return redis.Bool(z.con.Do("EXISTS", key))
+}
+
+func (z *ZDB) NewNamespace(ns string) error {
+	_, err := z.con.Do("NSNEW", ns)
+	return err
+}
+
+func (z *ZDB) Select(ns string) error {
+	_, err := z.con.Do("SELECT", ns)
+	return err
+}
+
+func (z *ZDB) DeleteNamespace(ns string) error {
+	_, err := z.con.Do("DELETE", ns)
+	return err
 }

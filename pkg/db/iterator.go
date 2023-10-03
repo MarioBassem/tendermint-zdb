@@ -1,7 +1,7 @@
 package db
 
 import (
-	"context"
+	"bytes"
 	"errors"
 
 	tmdb "github.com/tendermint/tm-db"
@@ -12,8 +12,8 @@ type zdbIterator struct {
 	forward     bool
 	start       []byte
 	end         []byte
-	nextCursor  string
-	scannedKeys []string
+	nextCursor  []byte
+	scannedKeys [][]byte
 	valid       bool
 	err         error
 }
@@ -34,12 +34,12 @@ func (z *zdbIterator) Valid() bool {
 		return false
 	}
 
-	if err := z.zdb.cl.Ping(context.TODO()); err != nil {
+	if err := z.zdb.Ping(); err != nil {
 		z.invalidate(err)
 		return false
 	}
 
-	exists, err := z.zdb.cl.Exists(context.Background(), z.scannedKeys[0])
+	exists, err := z.zdb.Exists(z.scannedKeys[0])
 	if err != nil {
 		z.invalidate(err)
 		return false
@@ -61,17 +61,17 @@ func (z *zdbIterator) Next() {
 		return
 	}
 
-	scanResponse, err := z.zdb.cl.ScanCursor(context.TODO(), z.nextCursor)
+	scanResponse, err := z.zdb.ScanCursor(z.nextCursor)
 	if err != nil {
 		z.invalidate(err)
 		return
 	}
 
 	z.nextCursor = scanResponse.Next
-	keys := make([]string, 0, len(scanResponse.Keys))
+	keys := make([][]byte, 0, len(scanResponse.Keys))
 
 	for _, k := range scanResponse.Keys {
-		if k.Key == string(z.end) {
+		if bytes.Equal(k.Key, z.end) {
 			break
 		}
 
@@ -103,7 +103,7 @@ func (z *zdbIterator) Value() (value []byte) {
 		panic(z.err)
 	}
 
-	val, err := z.zdb.cl.Get(context.TODO(), z.scannedKeys[0])
+	val, err := z.zdb.Get(z.scannedKeys[0])
 	if err != nil {
 		z.invalidate(err)
 		panic(z.err)
